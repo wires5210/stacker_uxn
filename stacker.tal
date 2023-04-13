@@ -1,0 +1,666 @@
+|00 @System  [ &halt $2 &pad $6 &r $2 &g $2 &b $2 &debug $1 &state $1 ]
+|10 @Console [ &io $2 &read $1 &pad $5 &write $1 &error $1 ]
+|20 @Screen  [ &frame $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1 ]
+|80 @Controller [ &press $2 &button $1 &key $1 &func $1 ]
+|c0 @Datetime [ &year $2 &month $1 &day $1 &hour $1 &minute $1 &second $1 &dotw $1 &doty $2 &isdst $1 ]
+
+( iam very new to this and the code is likely not very good as a result )
+( this can probably be rewritten a lot more conscisely and i already have some ideas on how to do that )
+( i'm pretty sure storing the whole grid and redrawing it is completely unnecessary .... )
+( but i'm far too lazy to deal with that rn .. maybe someday? )
+
+( to make this a bit easier for me i annotated what the working/return stacks contain at some points ..... )
+( # - working stack )
+( % - return stack )
+( val - byte value )
+( ^val - short value )
+( &val byte address of value )
+( *val short address of value )
+
+( some macros .... )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    %BREAKPOINT { #010e DEO }
+
+    %PICK { JMP SWP POP } ( a b condition -- [a if condition, else b] )
+    %PICK2 { JMP SWP2 POP2 } ( ^a ^b condition -- ^[a if condition, else b] )
+    %MOD { DIVk MUL SUB } ( a b -- [a % b] )
+    %MOD2 { DIV2k MUL2 SUB2 } ( ^a ^b -- ^[a % b] )
+
+    %RESET_SCREENPOS { [ .draw_offset/x LDZ2 .Screen/x DEO2 ] [ .draw_offset/y LDZ2 .Screen/y DEO2 ] } ( sets screen position to .draw_offset )
+    %PRINT { .Console/write DEO }
+    %DBG_WORKSTACK { #01 .System/debug DEO }
+    %DBG_STOP { #01 .System/state DEO }
+    %DBG_SAYHI { LIT "H PRINT LIT "I PRINT }
+    %DBG_SAYBYE { LIT "B PRINT LIT "Y PRINT LIT "E PRINT }
+
+    %MIN { LTHk JMP SWP POP } ( a b -- [min(a, b)] )
+    %MAX { GTHk JMP SWP POP } ( a b -- [max(a, b)] )
+    %MIN2 { LTH2k JMP SWP2 POP2 } ( ^a ^b -- ^[min(a, b)] )
+    %MAX2 { GTH2k JMP SWP2 POP2 } ( ^a ^b -- ^[max(a, b)] )
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+|0000
+    @stack_bottom $1
+    @playblock [ 
+        &x $1 
+        &width $1 
+        &move_direction $1    
+        &move_timer $1 
+        &move_timer_max $1
+        &do_drop $1
+    ]
+
+    @drop_button_down $1
+    @grid [
+        &width $1
+        &height $1
+        &draw_width $2
+        &draw_height $2
+        &data
+            $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 $1 ( 16 * 1 byte )
+        ( &at, &put, &clear, &draw - at bottom )
+    ]
+
+    @draw_block_size $2
+    @draw_block_padding $2
+    @draw_offset [ &x $2 &y $2 ]
+    @won_last_game $1
+
+|0100 ( -> )    
+    .Datetime/second DEI ;rand/a STA
+
+    #2cef .System/r DEO2
+    #01cf .System/g DEO2
+    #2cef .System/b DEO2
+
+    #00c0 .Screen/width DEO2 
+    #00c0 .Screen/height DEO2 
+
+    [menu]init    
+    BRK
+
+( --- [menu] state --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @[menu]init ( -- ) [
+        clear-screen
+        #00 .drop_button_down STZ
+        ;[menu]on-frame .Screen/frame DEO2
+        ;[menu]on-press .Controller/press DEO2
+        
+        #0018 .Screen/x DEO2
+        #0018 .Screen/y DEO2
+        ;&menu-text #03 draw_text
+
+        #0024 .Screen/x DEO2
+        #0048 .Screen/y DEO2
+        ;&menu-subtext1 #03 draw_text
+        #0038 .Screen/x DEO2
+        #0052 .Screen/y DEO2
+        ;&menu-subtext1-2 #03 draw_text
+        
+        #0010 .Screen/x DEO2
+        #0078 .Screen/y DEO2
+        ;&menu-subtext2 #03 draw_text
+        JMP2r
+
+        &menu-text "welcome 20 "to 20 "STACKEr 00
+        &menu-subtext1 "press 20 "[down] 20 "to 00
+        &menu-subtext1-2 "drop 20 "block 00
+        &menu-subtext2 "press 20 "[down] 20 "to 20 "play 00
+    ]
+    @[menu]on-press [ ( -> )
+        ( break if the drop button hasn't only just been pressed )
+        .drop_button_down LDZ ( # was_drop_button_pressed )
+
+        ( is `down` currently pressed ? )
+        .Controller/button DEI #20 AND #00 GTH ( # was_drop_button_pressed is_drop_button_pressed )
+
+        ( save current drop button state )
+        .drop_button_down STZk POP 
+
+        ( break if button isnt just pressed )
+        [ #01 SWP SUB ORA ] #01 SWP SUB ( #is_drop_button_just_pressed )        
+        JMP BRK  ( # <empty> )
+
+        [play]init
+        BRK
+    ]
+    @[menu]on-frame [ ( -> ) 
+        ,&timer LDR INC ( # timer )
+        DUP #40 LTH #00 SWP ( # timer 00 condition )
+        PICK ,&timer STR ( # <empty> )
+        
+        .won_last_game LDZ #01 EQU JMP BRK
+        #0034 .Screen/x DEO2
+        #0098 .Screen/y DEO2
+        ;&menu-win-text ( # &menu-win-text )
+        [ #00 #01 ] [ ,&timer LDR #20 GTH ] PICK  ( # &menu-win-text text-color )
+        draw_text
+        BRK
+
+        &timer $1
+        &menu-win-text "YOU 20 "WIN 20 "!!! 00
+     ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+( --- playblock functions --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @playblock/draw [ ( block_x width spritesettings -- ) ( expects .Screen/[x, y] )
+        #00 .Screen/auto DEO
+        ;block_sprite .Screen/addr DEO2
+        STH .Screen/sprite STH ( # x width % spritesettings &.Screen/sprite )
+        ADDk NIP SWP ( # x2 x1 % spritesettings &.Screen/sprite )
+
+        ( get first block position .. )
+        #00 OVR ( # x2 x1 ^x1 % spritesettings &.Screen/sprite )
+        .draw_block_size LDZ2 MUL2k NIP2 SWP2 ( # x2 x1 ^offset_1 ^x1 % spritesettings &.Screen/sprite )
+        .draw_block_padding LDZ2 MUL2 ADD2 ( # x2 x1 ^offset_2 % spritesettings &.Screen/sprite )
+        .Screen/x DEI2 ADD2 .Screen/x DEO2 ( # x2 x1 % spritesettings &.Screen/sprite )
+        &loop_x
+            DEOkr ( draw sprite )
+            .Screen/x DEI2 .draw_block_size LDZ2 .draw_block_padding LDZ2 ADD2 ADD2 .Screen/x DEO2 ( increment screen x )
+            #01 ADD ( increment x1 )
+            NEQk ?&loop_x
+
+        POP2 POP2r ( # <empty> % <empty> )
+        JMP2r
+    ]
+    @playblock/get_height [ ( -- height )
+        .stack_bottom LDZ #01 SUB ( # playblock_row )
+        ( POP #00 )
+        #00 OVR ( # playblock_row ^playblock_row )  
+        .draw_block_padding LDZ2 MUL2 ( # playblock_row ^offset )
+        ROT #00 SWP ( # ^offset ^playblock_row )
+        .draw_block_size LDZ2 MUL2 ADD2 ( # ^screen_y )
+        .Screen/y DEI2 ADD2 
+
+        JMP2r
+    ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+
+
+( --- [play] state --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @[play]init ( -- ) [
+        clear-screen
+        #00 .playblock/do_drop STZ
+        #00 .won_last_game STZ
+        #00 .drop_button_down STZ
+        ;[play]on-frame .Screen/frame DEO2
+        ;[play]on-press .Controller/press DEO2
+
+        ( init data .... )
+        #08 .grid/width STZ
+        #10 .grid/height STZ
+        #00 .playblock/x STZ
+        #03 .playblock/width STZ
+        #08 .playblock/move_timer_max STZ
+        #00 .playblock/move_timer STZ 
+        #01 .playblock/move_direction STZ
+
+        #0008 .draw_block_size STZ2
+        #0001 .draw_block_padding STZ2
+
+        .grid/height LDZ .stack_bottom STZ
+        grid/clear
+
+        ( get grid draw width and height )
+        [ .draw_block_size LDZ2 ] [ #00 .grid/width LDZ ] MUL2 
+        [ .draw_block_padding LDZ2 ] [ #00 .grid/width LDZ #0001 SUB2 ] MUL2
+        ADD2
+        .grid/draw_width STZ2
+
+        [ .draw_block_size LDZ2 ] [ #00 .grid/height LDZ ] MUL2 
+        [ .draw_block_padding LDZ2 ] [ #00 .grid/height LDZ #0001 SUB2 ] MUL2
+        ADD2
+        .grid/draw_height STZ2
+
+        ( center horizontally / vertically )
+        ( set .draw_offset/x to [half screen width - half board width] )
+        ( set .draw_offset/y to [half screen height - half board height] )
+        [ .Screen/width DEI2 #01 SFT2 ] [ .grid/draw_width LDZ2 #01 SFT2 ] SUB2
+        .draw_offset/x STZ2
+
+        [ .Screen/height DEI2 #01 SFT2 ] [ .grid/draw_height LDZ2 #01 SFT2 ] SUB2
+        .draw_offset/y STZ2
+        
+
+        ( draw background )
+        [ .draw_offset/x LDZ2 #0004 SUB2 ] [ .draw_offset/y LDZ2 #0004 SUB2 ] ( # ^x ^y )
+        OVR2 OVR2 ( # ^x ^y ^x ^y )
+
+        
+        .Screen/y DEO2 .Screen/x DEO2
+        [ .grid/draw_width LDZ2 #0008 ADD2 ] #03 line/horizontal
+        [ .grid/draw_height LDZ2 #0008 ADD2 ] #03 line/vertical
+        .Screen/y DEO2 .Screen/x DEO2
+        [ .grid/draw_height LDZ2 #0008 ADD2 ] #03 line/vertical
+        [ .grid/draw_width LDZ2 #0009 ADD2 ] #03 line/horizontal
+        ( last line is 1 pixel longer, to make the bottom right corner solid )
+
+        RESET_SCREENPOS
+        grid/draw
+        JMP2r
+    ]
+    
+    @[play]on-press ( -> ) [ 
+        ( break if the drop button hasn't only just been pressed )
+        .drop_button_down LDZ ( # was_drop_button_pressed )
+
+        ( is `down` currently pressed ? )
+        .Controller/button DEI #20 AND #00 GTH ( # was_drop_button_pressed is_drop_button_pressed )
+
+        ( save current drop button state )
+        .drop_button_down STZk POP 
+
+        ( break if button isnt just pressed )
+        [ #01 SWP SUB ORA ] #01 SWP SUB ( #is_drop_button_just_pressed )        
+        JMP BRK  ( # <empty> )
+
+        #01 .playblock/do_drop STZ
+    ]
+
+    @[play]on-frame ( -> ) [
+        .playblock/do_drop LDZ #00 EQU ?&s
+        .stack_bottom LDZ #01 NEQ ?&d
+        .playblock/x LDZ #01 grid/at #01 EQU ?&s
+        &d playblock/drop #00 .playblock/do_drop STZ BRK
+        &s
+
+        ( if the timer is > 0, break; else set it to max )
+        .playblock/move_timer LDZ #00 EQU ?&move
+            .playblock/move_timer LDZ #01 SUB .playblock/move_timer STZ
+            BRK
+        &move
+        .playblock/move_timer_max LDZ .playblock/move_timer STZ
+
+        ( set .Screen/y )
+        RESET_SCREENPOS
+        playblock/get_height .Screen/y DEO2
+
+        .Screen/x DEI2 .Screen/y DEI2 ( keep these for later .. )
+        ( clear current playblock )
+        .playblock/x LDZ .playblock/width LDZ #40 playblock/draw
+        .Screen/y DEO2 .Screen/x DEO22 ( change them back after drawing the block )
+
+        ( if &move_direction == 1:
+            increase &x
+            if &x + width == width: set move_direction to 2
+        else:
+            decrease &x
+            if &x == 0: set move_direction to 1
+            )
+        #01 .playblock/move_direction LDZ EQU ?&move-if ( # <empty> ) !&move-else
+        &move-if
+            .playblock/x LDZ INC ( # x )
+            .playblock/x STZk POP ( # x )
+            .playblock/width LDZ ADD ( # [x+width] )
+            .grid/width LDZ NEQ ?&end-move-if ( # <empty> )
+            #02 .playblock/move_direction STZ
+        !&end-move-if
+        &move-else
+            .playblock/x LDZ #01 SUB ( # x )
+            .playblock/x STZk POP ( # x )
+            #00 NEQ ?&end-move-if ( # <empty> )
+            #01 .playblock/move_direction STZ
+        &end-move-if
+
+        ( draw new playblock )
+        .playblock/x LDZ .playblock/width LDZ #43 playblock/draw
+        BRK
+    ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+( --- [gameover] state --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @[gameover]init [ ( -- )
+        #50 ,gameover_timer STR
+        ;[gameover]on-frame .Screen/frame DEO2
+        #0000 .Controller/press DEO2
+        JMP2r
+    ]
+    @[gameover]on-frame [ ( -> )
+        ( do [menu]init when the timer runs out )
+        ,gameover_timer LDR 
+        #01 SUB
+        DUP ,gameover_timer STR
+        #00 EQU JMP BRK
+        [menu]init
+        BRK
+    ]
+    @gameover_timer 00
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+
+( --- @grid functions .... --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @grid/at [ ( x y -- is_block_present ) 
+        .grid/data ADD ( # x &row )
+        LDZ ( # x row )
+        SWP ( # row x )
+        SFT #01 AND ( # is_block_present )
+        JMP2r
+    ]
+
+    @grid/put [ ( x y -- )
+        SWP STH ( # y % x )
+        .grid/data ADD ( # &row % x )
+        DUP LDZ STHr ( # &row row x )
+
+        ( to shift left, the value needs to be in the upper nibble, so shift x left by 4 first .. )
+        #40 SFT ( # &row row x )
+        #01 SWP SFT ORA ( # &row new_row )
+        SWP STZ
+        JMP2r
+    ]
+
+    @grid/clear [ ( -- )
+        #00 ( # y )
+        &loop_y
+            DUP .grid/data ADD ( # y &grid_row )
+            #00 SWP STZ
+            INC
+            DUP .grid/height LDZ NEQ ?&loop_y
+        POP
+        JMP2r
+    ]
+
+    @grid/draw [ ( -- ) ( expects .Screen/[x, y] )
+        #00 ,&current_x STR
+        #00 ,&current_y STR
+        ,&start JMP
+
+        &current_x 00
+        &current_y 00
+
+        &start
+        .Screen/x DEI2 ( # ^origin_x )
+        ;block_sprite .Screen/addr DEO2
+        #00 .Screen/auto DEO
+
+        &loop_y [
+            ( set .Screen/x to origin_x )
+            DUP2 .Screen/x DEO2 ( # ^origin_x )
+
+            ( set current_x to 0 )
+            #00 ,&current_x STR
+
+            &loop_x [
+                ( if a block is present at {current_x, current_y}, 
+                    draw a block at current screen position
+                    else, clear block at current screen position )
+                #43 #40 [ ,&current_x LDR ,&current_y LDR grid/at ] PICK
+                .Screen/sprite DEO ( # <unchanged> )
+
+                ( increment .Screen/x by block size + block gap )
+                .Screen/x DEI2 .draw_block_size LDZ2 .draw_block_padding LDZ2 ADD2 ADD2
+                .Screen/x DEO2 ( # <unchanged> )
+
+                ( increment current_x; jump to &loop_x if it's < width )
+                ,&current_x LDR INC DUP ,&current_x STR ( # ^origin_x current_x )
+                .grid/width LDZ LTH ?&loop_x ( # ^origin_x )
+            ]
+
+            ( increment .Screen/y by block_size + block_gap )
+            .Screen/y DEI2 .draw_block_size LDZ2 .draw_block_padding LDZ2 ADD2 ADD2
+            .Screen/y DEO2 ( # <unchanged> )
+
+            ( increment current_y; jump to &loop_y if it's < height )
+            ,&current_y LDR INC DUP ,&current_y STR ( # ^origin_x current_y )
+            .grid/height LDZ LTH ?&loop_y ( # ^origin_x )
+        ]
+        POP2 ( # <empty> )
+        JMP2r
+    ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+( --- @playblock functions  ..... --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @playblock/drop ( -- ) [
+        RESET_SCREENPOS
+
+        ( keep playblock position to redraw it later )
+        ( unless the gameover state is entered )
+        .playblock/x LDZ ;&playblock_prev_x STA
+        .playblock/width LDZ ;&playblock_prev_width STA
+
+        ( for each block of playblock:
+            if [.stack_bottom==.grid/height] or there is a block below, grid/put a block there
+            else, .playblock/width -= 1
+        )
+        .playblock/x LDZ DUP .playblock/width LDZ ADD SWP ( # x2 x1 )
+        &loop
+            .stack_bottom LDZ .grid/height LDZ EQU ( # x2 x1 is_on_bottom )
+            OVR .stack_bottom LDZ grid/at ( # x2 x1 is_on_bottom has_block_below )
+            ORA ( # x2 x1 should_place_block )
+            ( it is a bad idea to call ;grid/at when stack_bottom==.grid/height
+              since it's going to check for blocks outside of the grid's memory
+              but, in that case #is_on_bottom==01 anyways, so 
+              no matter what @grid/at picks up in this case, 
+              #should_place_block will always be non-zero
+            )
+            
+            ?&if_should_place_block !&else_should_place_block ( # x2 x1 )
+            &if_should_place_block
+                DUP .stack_bottom LDZ #01 SUB ( # x2 x1 block_x block_y )
+                grid/put ( # x2 x1 )
+
+                !&endif_should_place_block
+            &else_should_place_block
+                .playblock/width LDZ #01 SUB .playblock/width STZ
+            &endif_should_place_block
+            ( # x2 x1 )
+            INC NEQk ?&loop
+        POP POP ( # <empty> )
+
+        ( if block width == 0, move to gameover state,, )
+        .playblock/width LDZ #00 NEQ ?&no-gameover
+        [gameover]init
+        JMP2r
+        &no-gameover
+
+        ( decrease stack bottom )
+        [ .stack_bottom LDZ #01 SUB ] .stack_bottom STZ
+
+        ( randomize move direction )
+        #01 #02 [ rand #01 AND ] PICK .playblock/move_direction STZ
+
+        ( increase move speed at certain points )
+        [ .playblock/move_timer_max LDZ ] [ DUP #02 SUB ] ( # old_timer new_timer )
+        [ .grid/height LDZ .stack_bottom LDZ ] SUB ( # old_timer new_timer stack_height )
+        #04 MOD #00 NEQ PICK
+        .playblock/move_timer_max STZ
+
+        ( decrease playblock width at certain points )
+        #03 ( # max_width )
+        [ .stack_bottom LDZ ] #0b NEQ ?&mw_skip_1
+        POP #02
+        &mw_skip_1 [ .stack_bottom LDZ ] #06 NEQ ?&mw_skip_2
+        POP #01
+        &mw_skip_2
+        .playblock/width LDZ MIN .playblock/width STZ
+
+        
+        ( set playblock/x to left or right side depending on move direction )
+        #00 ( left edge )
+        [ .grid/width LDZ .playblock/width LDZ ] SUB ( right edge )
+        .playblock/move_direction LDZ #01 EQU ( moving right? )
+        PICK
+        .playblock/x STZ
+
+        ( if .playblock/width==0, game over )
+        .playblock/width LDZ #00 NEQ ?&not_game_over 
+        [menu]init
+        JMP2r
+        &not_game_over
+
+        ( if .stack_depth==0, win )
+        .stack_bottom LDZ #00 NEQ ?&not_win
+        #01 .won_last_game STZ
+        [menu]init
+        JMP2r
+        &not_win
+        ( redraw grid, redraw playblock, reset move timer )
+
+        RESET_SCREENPOS
+        grid/draw
+        
+        RESET_SCREENPOS
+        playblock/get_height .Screen/y DEO2 ( # <empty> )
+        .playblock/x LDZ .playblock/width LDZ #43 playblock/draw
+        .playblock/move_timer_max LDZ .playblock/move_timer STZ
+        JMP2r
+
+        &playblock_prev_x $1
+        &playblock_prev_width $1
+    ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+
+( --- some utils .... --- )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @block_sprite ff ff ff ff ff ff ff ff
+    @lts2 ( a b -- a < b; signed )
+        #8000 STH2k ADD2 SWP2 STH2r ADD2 GTH2 JMP2r 
+    @gts2 ( a b -- a > b; signed )
+        #8000 STH2k ADD2 SWP2 STH2r ADD2 LTH2 JMP2r 
+    @abs2 ( a -- |a|; signed )
+        DUP2 #0f SFT2 EQU #05 JCN #0000 SWP2 SUB2 JMP2r
+
+
+    @printhex [ ( v* -- )
+        SWP ,&byte JSR
+        &byte ( byte -- ) DUP #04 SFT ,&char JSR
+        &char ( char -- ) #0f AND DUP #09 GTH #27 MUL ADD #30 ADD #18 DEO
+        JMP2r
+    ]
+
+    @rand [ ( -- number ) ( https://github.com/keijiro/uxn-sketches/blob/main/prng.tal )
+        ( 8-bit PRNG https://github.com/edrosten/8bit_rng )
+        ( t = x ^ (x << 4) )
+        ,&x LDR DUP #40 SFT EOR
+        ( x = y )
+        ,&y LDR ,&x STR
+        ( y = z )
+        ,&z LDR ,&y STR
+        ( z = a )
+        ,&a LDR DUP ,&z STR
+        ( a = z ^ t ^ (z >> 1) ^ (t << 1) )
+        DUP #10 SFT EOR SWP DUP #01 SFT EOR EOR
+        DUP ,&a STR
+        JMP2r
+        &x $1 &y $1 &z $1 &a $1
+    ]
+
+    @line [
+        &generic [ ( ^length pixel auto -- ) ( expects .Screen/[x, y] )
+            .Screen/auto DEO ( # ^length pixel ) 
+            STH ( # ^length % pixel )
+            .Screen/pixel STH ( # ^length % pixel &.Screen/pixel )
+            &lineloop
+                DEOkr
+                #0001 SUB2
+                DUP2 ORA ?&lineloop
+            POP2 POP2r ( # <empty> % <empty> )
+            JMP2r
+        ]
+        &horizontal [ ( ^length pixel -- ) ( expects .Screen/[x, y] )
+            #01 !line/generic
+        ]
+        &vertical [ ( ^length pixel -- ) ( expects .Screen/[x, y] )
+            #02 !line/generic
+        ]
+    ]
+
+    @clear-screen [ ( -- ) ( this doesn't feel right :[ )
+        #40 STH .Screen/sprite STH
+        #00 .Screen/sprite
+        #0000 ,&y STR2
+
+        ;block_sprite .Screen/addr DEO2
+        #f2 .Screen/auto DEO
+
+        ( just fill the whole thing with blank sprites )
+        ( # empty_bg &.Screen/sprite % empty_fg &.Screen/sprite )
+        &y-loop
+            ,&y LDR2 .Screen/y DEO2
+            #0000 .Screen/x DEO2
+            DEOk DEOkr
+            ,&y LDR2 .Screen/y DEO2
+            .Screen/width DEI2 #0002 DIV2 .Screen/x DEO2
+            DEOk DEOkr
+
+            ,&y LDR2 #0008 ADD2
+            DUP2 ,&y STR2
+            .Screen/height DEI2 NEQ2 ?&y-loop
+                            
+        POP POP POPr POPr
+        JMP2r
+        &y $2
+    ]
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
+
+
+( --- text drawing --- code/font from https://git.sr.ht/~rabbits/uxn/blob/main/projects/examples/gui/monospace.tal )
+( /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ )
+    @draw_text ( *string color -- )
+        #01 .Screen/auto DEO
+        STH
+        &while
+            ( get sprite ) LDAk #20 SUB #00 SWP #30 SFT2 ;font ADD2 .Screen/addr DEO2
+            ( draw ) STHkr .Screen/sprite DEO
+            INC2 LDAk ,&while JCN
+        POPr
+        POP2
+    JMP2r
+    @font ( bbcmicro )
+        0000 0000 0000 0000 1818 1818 1800 1800
+        6c6c 6c00 0000 0000 3636 7f36 7f36 3600
+        0c3f 683e 0b7e 1800 6066 0c18 3066 0600
+        386c 6c38 6d66 3b00 0c18 3000 0000 0000
+        0c18 3030 3018 0c00 3018 0c0c 0c18 3000
+        0018 7e3c 7e18 0000 0018 187e 1818 0000
+        0000 0000 0018 1830 0000 007e 0000 0000
+        0000 0000 0018 1800 0006 0c18 3060 0000
+        3c66 6e7e 7666 3c00 1838 1818 1818 7e00
+        3c66 060c 1830 7e00 3c66 061c 0666 3c00
+        0c1c 3c6c 7e0c 0c00 7e60 7c06 0666 3c00
+        1c30 607c 6666 3c00 7e06 0c18 3030 3000
+        3c66 663c 6666 3c00 3c66 663e 060c 3800
+        0000 1818 0018 1800 0000 1818 0018 1830
+        0c18 3060 3018 0c00 0000 7e00 7e00 0000
+        3018 0c06 0c18 3000 3c66 0c18 1800 1800
+        3c66 6e6a 6e60 3c00 3c66 667e 6666 6600
+        7c66 667c 6666 7c00 3c66 6060 6066 3c00
+        786c 6666 666c 7800 7e60 607c 6060 7e00
+        7e60 607c 6060 6000 3c66 606e 6666 3c00
+        6666 667e 6666 6600 7e18 1818 1818 7e00
+        3e0c 0c0c 0c6c 3800 666c 7870 786c 6600
+        6060 6060 6060 7e00 6377 7f6b 6b63 6300
+        6666 767e 6e66 6600 3c66 6666 6666 3c00
+        7c66 667c 6060 6000 3c66 6666 6a6c 3600
+        7c66 667c 6c66 6600 3c66 603c 0666 3c00
+        7e18 1818 1818 1800 6666 6666 6666 3c00
+        6666 6666 663c 1800 6363 6b6b 7f77 6300
+        6666 3c18 3c66 6600 6666 663c 1818 1800
+        7e06 0c18 3060 7e00 7c60 6060 6060 7c00
+        0060 3018 0c06 0000 3e06 0606 0606 3e00
+        183c 6642 0000 0000 0000 0000 0000 00ff
+        1c36 307c 3030 7e00 0000 3c06 3e66 3e00
+        6060 7c66 6666 7c00 0000 3c66 6066 3c00
+        0606 3e66 6666 3e00 0000 3c66 7e60 3c00
+        1c30 307c 3030 3000 0000 3e66 663e 063c
+        6060 7c66 6666 6600 1800 3818 1818 3c00
+        1800 3818 1818 1870 6060 666c 786c 6600
+        3818 1818 1818 3c00 0000 367f 6b6b 6300
+        0000 7c66 6666 6600 0000 3c66 6666 3c00
+        0000 7c66 667c 6060 0000 3e66 663e 0607
+        0000 6c76 6060 6000 0000 3e60 3c06 7c00
+        3030 7c30 3030 1c00 0000 6666 6666 3e00
+        0000 6666 663c 1800 0000 636b 6b7f 3600
+        0000 663c 183c 6600 0000 6666 663e 063c
+        0000 7e0c 1830 7e00 0c18 1870 1818 0c00
+        1818 1800 1818 1800 3018 180e 1818 3000
+        316b 4600 0000 0000 ffff ffff ffff ffff
+( \/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ )
